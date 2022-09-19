@@ -18,27 +18,31 @@ import 'flutter_adapter_args.dart';
 import 'mixins.dart';
 
 /// A DAP Debug Adapter for running and debugging Flutter applications.
-class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments, FlutterAttachRequestArguments>
-    with PidTracker {
+class FlutterDebugAdapter extends DartDebugAdapter<
+    FlutterLaunchRequestArguments,
+    FlutterAttachRequestArguments> with PidTracker {
   FlutterDebugAdapter(
     ByteStreamServerChannel channel, {
     required this.fileSystem,
     required this.platform,
-    bool ipv6 = false,
+    super.ipv6,
     bool enableDds = true,
-    bool enableAuthCodes = true,
-    Logger? logger,
-  }) : super(
-    channel,
-    ipv6: ipv6,
-    enableDds: enableDds,
-    enableAuthCodes: enableAuthCodes,
-    logger: logger,
-  );
+    super.enableAuthCodes,
+    super.logger,
+  })  : _enableDds = enableDds,
+        // Always disable in the DAP layer as it's handled in the spawned
+        // 'flutter' process.
+        super(enableDds: false);
 
   FileSystem fileSystem;
   Platform platform;
   Process? _process;
+
+  /// Whether DDS should be enabled in the Flutter process.
+  ///
+  /// We never enable DDS in the DAP process for Flutter, so this value is not
+  /// the same as what is passed to the base class, which is always provided 'false'.
+  final bool _enableDds;
 
   @override
   final FlutterLaunchRequestArguments Function(Map<String, Object?> obj)
@@ -66,7 +70,8 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
 
   /// Outstanding requests that have been sent to the Flutter run daemon and
   /// their handlers.
-  final Map<int, Completer<Object?>> _flutterRequestCompleters = <int, Completer<Object?>>{};
+  final Map<int, Completer<Object?>> _flutterRequestCompleters =
+      <int, Completer<Object?>>{};
 
   /// Whether or not this adapter can handle the restartRequest.
   ///
@@ -136,14 +141,15 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
   /// Called by [attachRequest] to request that we actually connect to the app to be debugged.
   @override
   Future<void> attachImpl() async {
-    final FlutterAttachRequestArguments args = this.args as FlutterAttachRequestArguments;
+    final FlutterAttachRequestArguments args =
+        this.args as FlutterAttachRequestArguments;
 
     final String? vmServiceUri = args.vmServiceUri;
     final List<String> toolArgs = <String>[
       'attach',
       '--machine',
-      if (vmServiceUri != null)
-      ...<String>['--debug-uri', vmServiceUri],
+      if (!_enableDds) '--no-dds',
+      if (vmServiceUri != null) ...<String>['--debug-uri', vmServiceUri],
     ];
 
     await _startProcess(
@@ -205,6 +211,9 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
   /// quickly and therefore may leave orphaned processes.
   @override
   Future<void> disconnectImpl() async {
+    if (isAttach) {
+      await preventBreakingAndResume();
+    }
     terminatePids(ProcessSignal.sigkill);
   }
 
@@ -233,11 +242,12 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
       return;
     }
 
-    final String errorText = (errorData['renderedErrorText'] as String?)
-        ?? (errorData['description'] as String?)
+    final String errorText = (errorData['renderedErrorText'] as String?) ??
+        (errorData['description'] as String?)
         // We should never not error text, but if we do at least send something
         // so it's not just completely silent.
-        ?? 'Unknown error in Flutter.Error event';
+        ??
+        'Unknown error in Flutter.Error event';
     sendOutput('stderr', '$errorText\n');
   }
 
@@ -247,11 +257,13 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
   /// breakpoints, and resume.
   @override
   Future<void> launchImpl() async {
-    final FlutterLaunchRequestArguments args = this.args as FlutterLaunchRequestArguments;
+    final FlutterLaunchRequestArguments args =
+        this.args as FlutterLaunchRequestArguments;
 
     final List<String> toolArgs = <String>[
       'run',
       '--machine',
+      if (!_enableDds) '--no-dds',
       if (enableDebugger) '--start-paused',
       // Structured errors are enabled by default, but since we don't connect
       // the VM Service for noDebug, we need to disable them so that error text
@@ -281,7 +293,9 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
     List<String>? userArgs,
   }) async {
     // Handle customTool and deletion of any arguments for it.
-    final String executable = customTool ?? fileSystem.path.join(Cache.flutterRoot!, 'bin', platform.isWindows ? 'flutter.bat' : 'flutter');
+    final String executable = customTool ??
+        fileSystem.path.join(Cache.flutterRoot!, 'bin',
+            platform.isWindows ? 'flutter.bat' : 'flutter');
     final int? removeArgs = customToolReplacesArgs;
     if (customTool != null && removeArgs != null) {
       toolArgs.removeRange(0, math.min(removeArgs, toolArgs.length));
@@ -308,7 +322,8 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
   }
 
   @visibleForOverriding
-  Future<void> launchAsProcess(String executable, List<String> processArgs) async {
+  Future<void> launchAsProcess(
+      String executable, List<String> processArgs) async {
     logger?.call('Spawning $executable with $processArgs in ${args.cwd}');
     final Process process = await Process.start(
       executable,
@@ -379,6 +394,9 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
   /// Called by [terminateRequest] to request that we gracefully shut down the app being run (or in the case of an attach, disconnect).
   @override
   Future<void> terminateImpl() async {
+    if (isAttach) {
+      await preventBreakingAndResume();
+    }
     terminatePids(ProcessSignal.sigterm);
     await _process?.exitCode;
   }
@@ -386,8 +404,25 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
   /// Connects to the VM Service if the app.started event has fired, and a VM Service URI is available.
   void _connectDebuggerIfReady() {
     final Uri? serviceUri = _vmServiceUri;
+
     if (_receivedAppStarted && serviceUri != null) {
-      connectDebugger(serviceUri, resumeIfStarting: true);
+      if (enableDebugger) {
+        connectDebugger(serviceUri, resumeIfStarting: true);
+      } else {
+        // Usually, `connectDebugger` (in the base Dart adapter) will send this
+        // event when it connects a debugger. Since we're not connecting a
+        // debugger we send this ourselves, to allow clients to connect to the
+        // VM Service for things like starting DevTools, even if debugging is
+        // not available.
+        // TODO(dantup): Switch this to call `sendDebuggerUris()` on the base
+        //   adapter once rolled into Flutter.
+        sendEvent(
+          RawEventBody(<String, Object?>{
+            'vmServiceUri': serviceUri.toString(),
+          }),
+          eventType: 'dart.debuggerUris',
+        );
+      }
     }
   }
 
@@ -401,6 +436,15 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
   void _handleAppStarted() {
     appStartedCompleter.complete();
     _connectDebuggerIfReady();
+
+    // Send a custom event so the editor knows the app has started.
+    //
+    // This may be useful when there's no VM Service (for example Profile mode)
+    // but the editor still wants to know that startup has finished.
+    sendEvent(
+      RawEventBody(<String, Object?>{}),
+      eventType: 'flutter.appStarted',
+    );
   }
 
   /// Handles the daemon.connected event, recording the pid of the flutter_tools process.
@@ -416,12 +460,6 @@ class FlutterDebugAdapter extends DartDebugAdapter<FlutterLaunchRequestArguments
 
   /// Handles the app.debugPort event from Flutter, connecting to the VM Service if everything else is ready.
   void _handleDebugPort(Map<String, Object?> params) {
-    // When running in noDebug mode, Flutter may still provide us a VM Service
-    // URI, but we will not connect it because we don't want to do any debugging.
-    if (!enableDebugger) {
-      return;
-    }
-
     // Capture the VM Service URL which we'll connect to when we get app.started.
     final String? wsUri = params['wsUri'] as String?;
     if (wsUri != null) {
